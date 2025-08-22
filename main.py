@@ -1,0 +1,156 @@
+#LangChain literally restricts the LLM to only use retrieved context — not general knowledge.
+
+# STEP 1: Import all necessary libraries
+from langchain_ollama import OllamaLLM
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.chains import RetrievalQA
+from langchain_community.document_loaders import PyPDFLoader
+from langchain_community.vectorstores import FAISS
+from langchain_ollama.embeddings import OllamaEmbeddings
+import os
+from langchain.prompts import PromptTemplate
+
+#from langchain_core.runnables import RunnableSequence
+
+def load_user_pdf():
+    import tkinter as tk
+    from tkinter import filedialog
+    from langchain_community.document_loaders import PyPDFLoader
+
+    root = tk.Tk()
+    root.withdraw()  # hide the empty Tk window
+
+    file_path = filedialog.askopenfilename(
+        title="Select a PDF",
+        filetypes=[("PDF files", "*.pdf")]
+    )
+    if not file_path:
+        print("No file selected. Exiting.")
+        raise SystemExit(0)
+
+    loader = PyPDFLoader(file_path)
+    pages = loader.load()
+    print(f" Loaded {len(pages)} pages from: {file_path}")
+    return pages, file_path
+
+pages, pdf_path = load_user_pdf()
+# STEP 2: Load the PDF file
+#pdf_path = "document.pdf"
+VECTOR_DB_PATH = "faiss_index"
+#loader = PyPDFLoader(pdf_path)
+#pages = loader.load()
+#print(f" Loaded {len(pages)} pages from PDF.")
+
+
+#LLMs(LLaMA3) can't handle  50 pages at once so we break it down
+splitter=RecursiveCharacterTextSplitter(chunk_size=1200,chunk_overlap=200)
+chunks=splitter.split_documents(pages)
+#chunks=chunks[:10]
+
+print(f"split into {len(chunks)} chunks.")
+
+# convet chunks into vector embeddings
+embeddings=OllamaEmbeddings(model="llama3")
+
+
+#FAISS->vector search engine
+#stores all chunks as vectors and when we ask ques it finds the most similar chunks
+#vector_store=FAISS.from_documents(chunks,embeddings)
+
+if os.path.exists(VECTOR_DB_PATH):
+    print(" Loading saved vector store...")
+    vector_store = FAISS.load_local(
+        folder_path=VECTOR_DB_PATH,
+        embeddings=embeddings,
+        allow_dangerous_deserialization=True
+    )
+else:
+    print(" Creating new vector store from PDF chunks...")
+    vector_store = FAISS.from_documents(chunks, embeddings)
+    vector_store.save_local(VECTOR_DB_PATH)
+    print(" Saved vector store for future use.")
+    
+
+#connect to local llm using ollama
+llm=OllamaLLM(model="llama3")
+rerank_prompt = PromptTemplate.from_template(
+    """
+    You are a helpful assistant for answering questions based only on the provided documents.
+
+    When answering:
+    - Rank chunks of text based on how useful they might be for answering the question.
+    - Keep chunks if they contain keywords, related concepts, or explanations that could help.
+    - At the end, cite the page numbers (e.g., Sources: Page 2, Page 5).
+
+    Context:
+    {context}
+
+    Question:
+    {question}
+
+    Rank the chunks (most relevant first). Keep useful ones even if they don’t contain the full answer.
+    """
+)
+# STEP 8: Retriever with Reranking
+def rerank_documents(question, docs):
+    context = "\n\n".join([d.page_content[:500] for d in docs])
+    rerank_input = rerank_prompt.format(question=question, context=context)
+    ranked_text = llm.invoke(rerank_input)
+
+    # Simple trick: keep top N (e.g., 5)
+    top_docs = docs[:5]  
+    return top_docs
+
+# STEP 9: Build QA Chain
+retriever = vector_store.as_retriever(search_kwargs={"k": 15})  # get 15 first
+qa_chain = RetrievalQA.from_chain_type(
+    llm=llm,
+    retriever=retriever,
+    return_source_documents=True
+)
+print(" QA Chain ready!")
+
+# STEP 10: Ask Questions
+def format_sources(source_pages):
+    if not source_pages:
+        return "Sources: None"
+    unique_pages = sorted(set(source_pages))
+    page_list = ", ".join(f"Page {p}" for p in unique_pages)
+    return f"Sources: {page_list}"
+
+print("\n Ask anything about the PDF (type 'exit' to quit):")
+while True:
+    question = input("\n You: ")
+    if question.lower() == "exit":
+        print(" Bye!")
+        break
+
+    # Step A: get retrieved docs
+    docs = retriever.invoke(question)
+
+    # Step B: rerank them
+    top_docs = rerank_documents(question, docs)
+
+    # Step C: run QA only on top reranked docs
+    response = qa_chain.combine_documents_chain.invoke({
+        "input_documents": top_docs,
+        "question": question
+        
+    })
+    answer = response["output_text"]
+
+# Extract page numbers
+    source_pages = [doc.metadata.get("page", "?") for doc in top_docs if isinstance(doc.metadata.get("page", None), int)]
+    formatted_sources = format_sources(source_pages)
+
+    print(f"\n Answer:\n{answer}\n\n {formatted_sources}\n")
+
+# Preview chunks
+    print(" Source Preview:")
+    for i, doc in enumerate(top_docs):
+        page = doc.metadata.get("page", "?")
+        snippet = doc.page_content[:200].replace("\n", " ")
+        print(f"  • Page {page}: {snippet}...\n")
+        
+
+    
