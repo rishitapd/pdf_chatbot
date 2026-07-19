@@ -17,6 +17,7 @@ TOP_N_CHUNKS = 8
 CHUNK_SIZE = 900
 CHUNK_OVERLAP = 300
 RETRIEVAL_K = 40
+CHAT_HISTORY_TURNS = 5
 LLM_MODEL = "llama3"
 # llama3 only declares the "completion" capability in Ollama, not "embedding" —
 # it can't serve embeddings. Use a dedicated embedding model instead.
@@ -205,6 +206,35 @@ qa_prompt = PromptTemplate.from_template(
     """
 )
 
+condense_prompt = PromptTemplate.from_template(
+    """
+    Given a chat history and a follow-up question, rewrite the follow-up question
+    to be a standalone question that includes any necessary context from the
+    history (e.g. resolve "it"/"that"/"what about X" into what they refer to).
+    If the follow-up question is already standalone, return it unchanged.
+    Reply with ONLY the standalone question, no other text.
+
+    Chat History:
+    {chat_history}
+
+    Follow-up Question: {question}
+
+    Standalone Question:
+    """
+)
+
+def condense_question(llm, condense_prompt, chat_history, question):
+    """Rewrite a follow-up question into a standalone one using recent history.
+    Only used to steer retrieval/reranking — the final answer still comes strictly
+    from retrieved document context, not from the chat history itself."""
+    if not chat_history:
+        return question
+    history_text = "\n".join(f"Q: {q}\nA: {a}" for q, a in chat_history)
+    standalone = llm.invoke(
+        condense_prompt.format(chat_history=history_text, question=question)
+    ).strip()
+    return standalone if standalone else question
+
 def format_sources(source_pages):
     if not source_pages:
         return "Sources: None"
@@ -282,24 +312,32 @@ def main():
 
     # STEP 10: Ask Questions
     print("\n Ask anything about the PDF (type 'exit' to quit):")
+    chat_history = []  # list of (question, answer), used only to resolve follow-ups
     while True:
         question = input("\n You: ")
         if question.lower() == "exit":
             print(" Bye!")
             break
 
+        # Resolve follow-ups ("what about X", "and that?") into a standalone
+        # question using recent history, before retrieval/reranking. The final
+        # answer still comes strictly from retrieved document context below.
+        search_question = condense_question(llm, condense_prompt, chat_history, question)
+        if search_question != question:
+            print(f" (interpreting as: {search_question})")
+
         # Step A: get retrieved docs, capped per section so one dominant
         # section can't crowd out other equally relevant ones
-        docs = retriever.invoke(question)
+        docs = retriever.invoke(search_question)
         docs = diversify_by_section(docs)
 
         # Step B: rerank them
-        top_docs = rerank_documents(llm, rerank_prompt, question, docs)
+        top_docs = rerank_documents(llm, rerank_prompt, search_question, docs)
 
         # Step C: run QA only on top reranked docs
         response = qa_chain.combine_documents_chain.invoke({
             "input_documents": top_docs,
-            "question": question
+            "question": search_question
         })
         answer = response["output_text"]
 
@@ -320,6 +358,9 @@ def main():
             source = pathlib.Path(doc.metadata.get("source", "?")).name
             snippet = doc.page_content[:200].replace("\n", " ")
             print(f"  • {source} — Page {page_display}: {snippet}...\n")
+
+        chat_history.append((question, answer))
+        chat_history = chat_history[-CHAT_HISTORY_TURNS:]
 
 if __name__ == "__main__":
     main()
