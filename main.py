@@ -25,7 +25,8 @@ EMBEDDING_MODEL = "nomic-embed-text"
 
 #from langchain_core.runnables import RunnableSequence
 
-def load_user_pdf():
+def load_user_pdfs():
+    """Prompt for one or more PDFs and load each. Returns a list of (pages, file_path)."""
     import tkinter as tk
     from tkinter import filedialog
     from langchain_community.document_loaders import PyPDFLoader
@@ -33,18 +34,21 @@ def load_user_pdf():
     root = tk.Tk()
     root.withdraw()  # hide the empty Tk window
 
-    file_path = filedialog.askopenfilename(
-        title="Select a PDF",
+    file_paths = filedialog.askopenfilenames(
+        title="Select one or more PDFs",
         filetypes=[("PDF files", "*.pdf")]
     )
-    if not file_path:
+    if not file_paths:
         print("No file selected. Exiting.")
         raise SystemExit(0)
 
-    loader = PyPDFLoader(file_path)
-    pages = loader.load()
-    print(f" Loaded {len(pages)} pages from: {file_path}")
-    return pages, file_path
+    pdfs = []
+    for file_path in file_paths:
+        loader = PyPDFLoader(file_path)
+        pages = loader.load()
+        print(f" Loaded {len(pages)} pages from: {file_path}")
+        pdfs.append((pages, file_path))
+    return pdfs
 
 #pdf_path = "document.pdf"
 
@@ -138,11 +142,14 @@ def section_for_chunk(chunk):
 
 def diversify_by_section(docs, max_per_section=3):
     """Cap how many retrieved candidates come from the same section so one
-    dominant section doesn't crowd out other equally relevant ones before reranking."""
+    dominant section doesn't crowd out other equally relevant ones before reranking.
+    Keyed by (source, section) so identically-titled sections in different PDFs
+    (e.g. two handbooks both having a "II. GENERAL EMPLOYMENT INFORMATION") don't
+    share a quota."""
     counts = {}
     kept = []
     for doc in docs:
-        key = doc.metadata.get("section") or doc.metadata.get("source", "")
+        key = (doc.metadata.get("source", ""), doc.metadata.get("section") or "")
         if counts.get(key, 0) >= max_per_section:
             continue
         counts[key] = counts.get(key, 0) + 1
@@ -236,21 +243,26 @@ def condense_question(llm, condense_prompt, chat_history, question):
     return standalone if standalone else question
 
 def format_sources(source_pages):
+    """source_pages: list of (source_filename, page) tuples."""
     if not source_pages:
         return "Sources: None"
-    unique_pages = sorted(set(source_pages))
-    page_list = ", ".join(f"Page {p}" for p in unique_pages)
-    return f"Sources: {page_list}"
+    unique = sorted(set(source_pages))
+    distinct_sources = {s for s, _ in unique}
+    if len(distinct_sources) <= 1:
+        page_list = ", ".join(f"Page {p}" for _, p in unique)
+        return f"Sources: {page_list}"
+    # Multiple PDFs in play — group by source so "Page 3" isn't ambiguous.
+    grouped = {}
+    for s, p in unique:
+        grouped.setdefault(s, []).append(p)
+    parts = [f"{s} (Page {', '.join(str(p) for p in pages)})" for s, pages in grouped.items()]
+    return "Sources: " + "; ".join(parts)
 
-def main():
-    pages, pdf_path = load_user_pdf()
-    tag_pages_with_sections(pages)
-
-    # convert chunks into vector embeddings
-    embeddings = OllamaEmbeddings(model=EMBEDDING_MODEL)
-
+def load_or_build_index(pages, pdf_path, embeddings):
+    """Load this PDF's cached FAISS index, or build one if missing/stale."""
     INDEX_DIR = vector_store_path_for(pdf_path)
-    print(f" Index dir for this PDF: {INDEX_DIR}")
+    pdf_name = pathlib.Path(pdf_path).name
+    print(f" Index dir for {pdf_name}: {INDEX_DIR}")
 
     #LLMs(LLaMA3) can't handle 50 pages at once so we break it down — only do this
     #if we actually need to build/rebuild the index; a cached hit skips it entirely.
@@ -265,7 +277,10 @@ def main():
                 section = section_for_chunk(chunk)
                 if section:
                     chunk.metadata["section"] = section
-                    chunk.page_content = f"[Section: {section}]\n{chunk.page_content}"
+                header = f"Source: {pdf_name}"
+                if section:
+                    header += f" | Section: {section}"
+                chunk.page_content = f"[{header}]\n{chunk.page_content}"
                 chunk.metadata.pop("_section_checkpoints", None)
                 chunk.metadata.pop("_section_entry", None)
             _chunks_cache["chunks"] = chunks
@@ -284,7 +299,7 @@ def main():
             any_id = next(iter(vector_store.docstore._dict))
             any_doc = vector_store.docstore._dict[any_id]
             stored_source = any_doc.metadata.get("source", "")
-            if pathlib.Path(stored_source).name != pathlib.Path(pdf_path).name:
+            if pathlib.Path(stored_source).name != pdf_name:
                 print(" Index/source mismatch. Rebuilding index for this PDF...")
                 vector_store = build_faiss(get_chunks(), embeddings, INDEX_DIR)
                 print("  Rebuilt and saved vector store.")
@@ -296,6 +311,25 @@ def main():
         print(" Creating new vector store from PDF chunks...")
         vector_store = build_faiss(get_chunks(), embeddings, INDEX_DIR)
         print(" Saved vector store for future use.")
+    return vector_store
+
+def main():
+    pdfs = load_user_pdfs()
+
+    # convert chunks into vector embeddings
+    embeddings = OllamaEmbeddings(model=EMBEDDING_MODEL)
+
+    # Build/load each PDF's own cached index, then merge them into one
+    # combined store for the session — each chunk keeps its own source/page
+    # metadata, so citations still say which PDF a chunk came from.
+    vector_store = None
+    for pages, pdf_path in pdfs:
+        tag_pages_with_sections(pages)
+        pdf_store = load_or_build_index(pages, pdf_path, embeddings)
+        if vector_store is None:
+            vector_store = pdf_store
+        else:
+            vector_store.merge_from(pdf_store)
 
     #connect to local llm using ollama
     llm = OllamaLLM(model=LLM_MODEL)
@@ -311,7 +345,7 @@ def main():
     print(" QA Chain ready!")
 
     # STEP 10: Ask Questions
-    print("\n Ask anything about the PDF (type 'exit' to quit):")
+    print("\n Ask anything about the loaded PDF(s) (type 'exit' to quit):")
     chat_history = []  # list of (question, answer), used only to resolve follow-ups
     while True:
         question = input("\n You: ")
@@ -341,9 +375,9 @@ def main():
         })
         answer = response["output_text"]
 
-        # Extract page numbers (PyPDFLoader pages are 0-indexed; +1 for display)
+        # Extract (source, page) pairs (PyPDFLoader pages are 0-indexed; +1 for display)
         source_pages = [
-            doc.metadata.get("page") + 1
+            (pathlib.Path(doc.metadata.get("source", "?")).name, doc.metadata.get("page") + 1)
             for doc in top_docs
             if isinstance(doc.metadata.get("page", None), int)
         ]
