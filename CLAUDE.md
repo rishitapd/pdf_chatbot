@@ -4,19 +4,22 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-A single-script command-line PDF chatbot. It loads a PDF (via a file picker dialog), splits it into chunks, embeds the chunks with a local Ollama model, stores/loads the embeddings in a per-PDF FAISS index, and answers user questions in a REPL loop using retrieval-augmented generation — answers are restricted to the retrieved PDF context, not the LLM's general knowledge.
+A command-line PDF chatbot. It loads a PDF (via a file picker dialog), splits it into chunks, embeds the chunks with a local Ollama model, stores/loads the embeddings in a per-PDF FAISS index, and answers user questions in a REPL loop using retrieval-augmented generation — answers are restricted to the retrieved PDF context, not the LLM's general knowledge.
 
-All logic currently lives in [main.py](main.py); there is no package structure, test suite, or build tooling.
+[main.py](main.py) is the working chatbot; there is no package structure, test suite, or build tooling. [experiments/hybrid_retrieval_demo.py](experiments/hybrid_retrieval_demo.py) is a separate, intentionally-not-working prototype exploring hybrid (FAISS + BM25) retrieval — see its module docstring for what's unfinished there. Don't port fixes from `main.py` into it or vice versa without checking both are still meant to diverge.
 
 ## Running
 
 ```
 python main.py
 ```
+or, on Windows, `.\run.ps1` — launches `main.py` with the project's venv Python directly, without needing to activate the venv first (useful since PowerShell doesn't persist activation across new terminal windows).
 
 This launches a Tkinter file-picker dialog — select a PDF file to begin. There are no CLI arguments; the PDF is chosen interactively.
 
-Requires a local [Ollama](https://ollama.com) server running with the `llama3` model pulled (`ollama pull llama3`), since both the LLM and the embeddings model are configured as `OllamaLLM(model="llama3")` / `OllamaEmbeddings(model="llama3")`.
+Requires a local [Ollama](https://ollama.com) server running with both:
+- `llama3` pulled (`ollama pull llama3`) — used for chat/generation and reranking (`LLM_MODEL` in main.py)
+- `nomic-embed-text` pulled (`ollama pull nomic-embed-text`) — used for embeddings (`EMBEDDING_MODEL` in main.py). `llama3` cannot be used for embeddings: it only declares Ollama's `completion` capability, not `embedding`, and will fail with a 501 error if you try.
 
 There is no `requirements.txt`/`pyproject.toml` in the repo. Dependencies observed in code: `langchain`, `langchain-community`, `langchain-ollama`, `langchain-core`, `faiss` (via `langchain_community.vectorstores.FAISS`), and the stdlib `tkinter`. Install what's missing before running.
 
@@ -24,17 +27,19 @@ There is no lint, test, or build command configured for this project.
 
 ## Architecture
 
-The script runs top-to-bottom as a linear pipeline (not organized into functions/classes beyond a few helpers), executed once per process:
+Everything runs inside `main()` (guarded by `if __name__ == "__main__":`), executed once per process:
 
 1. **PDF selection & load** — `load_user_pdf()` opens a native file dialog and loads pages with `PyPDFLoader`.
-2. **Chunking** — `RecursiveCharacterTextSplitter` (chunk_size=1200, chunk_overlap=200) splits pages into chunks, since the local LLM can't handle a full document at once.
-3. **Per-PDF vector store caching** — `vector_store_path_for()` derives a unique index directory under `faiss_indexes/<pdf-stem>_<hash>` from `filename|size|mtime`, so different PDFs (or edited versions of the same PDF) never collide or reuse a stale index. If an index directory exists, it's loaded and sanity-checked (`stored_source` metadata must match the current PDF's filename) via `build_faiss()`; otherwise a new FAISS index is built and saved there. The legacy top-level `faiss_index/` directory is a leftover from an earlier single-PDF version of this logic (see commented-out code in `main.py`) and is no longer written to — new indexes always go under `faiss_indexes/`.
-4. **Retrieval + reranking** — `vector_store.as_retriever(search_kwargs={"k": 30})` pulls 30 candidate chunks per question. `rerank_documents()` asks the LLM to rank them via `rerank_prompt`, but only truncates to the top 5 by original order (`docs[:5]`) rather than actually re-sorting by the LLM's ranking — the LLM ranking output is currently discarded.
-5. **Answering** — the top reranked docs are passed directly into `qa_chain.combine_documents_chain.invoke()` (bypassing the chain's own retriever, since retrieval/reranking already happened in steps 3–4). Answers are printed along with a deduplicated `Sources: Page X, Page Y` line and a per-chunk source preview (source filename + page + snippet).
-6. **Question loop** — a `while True` REPL reads from `input()` until the user types `exit`.
+2. **Section tagging** — `tag_pages_with_sections()` does best-effort heading detection (numbered/lettered patterns like `I.`, `A.`, `1.`) across all pages before chunking, recording an offset-ordered list of headings per page rather than a single page-level label — a page often spans the tail of one subsection and the start of the next.
+3. **Lazy chunking** — chunks are only computed when actually needed (building or rebuilding an index); a cache hit against an existing index skips chunking entirely. `RecursiveCharacterTextSplitter` (`CHUNK_SIZE=900`, `CHUNK_OVERLAP=300`, `add_start_index=True`) splits pages into chunks. `section_for_chunk()` then resolves each chunk's actual section from its own start offset (via the checkpoints from step 2, not the whole page's last heading), and that breadcrumb gets prepended to the chunk's text as `[Section: ...]` before embedding — this is baked into the embedded content, not just display metadata.
+4. **Per-PDF vector store caching** — `vector_store_path_for()` derives a unique index directory under `faiss_indexes/<pdf-stem>_<hash>` from `filename|size|mtime`, so different PDFs (or edited versions of the same PDF) never collide or reuse a stale index. If an index directory exists, it's loaded and sanity-checked (`stored_source` metadata must match the current PDF's filename); otherwise a new FAISS index is built and saved there. The legacy top-level `faiss_index/` directory is unused dead weight from an earlier version (see commented-out code) — new indexes always go under `faiss_indexes/`.
+5. **Retrieval, diversification, and reranking** — `vector_store.as_retriever(search_kwargs={"k": RETRIEVAL_K})` (k=40) pulls candidate chunks per question. `diversify_by_section()` caps candidates to at most 3 per section so one dominant section can't crowd out others on broad questions. `rerank_documents()` then asks the LLM to output an ordered list of chunk numbers and actually reorders by that ranking (parsed via regex, deduped, falls back to original order if parsing fails) — keeping the top `TOP_N_CHUNKS` (8).
+6. **Answering** — the top reranked docs are passed directly into `qa_chain.combine_documents_chain.invoke()` (bypassing the chain's own retriever, since retrieval/reranking already happened). `qa_chain` is built with a custom `qa_prompt` (via `chain_type_kwargs`) instructing the model to preserve exact conditional language from the source ("the greater of X or Y", not just "X") and to admit when the context doesn't contain an answer rather than guess. Answers are printed along with a deduplicated `Sources: Page X, Page Y` line (1-indexed — `PyPDFLoader`'s raw `page` metadata is 0-indexed) and a per-chunk source preview (source filename + page + snippet).
+7. **Question loop** — a `while True` REPL reads from `input()` until the user types `exit`.
 
 ## Key conventions / gotchas
 
 - FAISS indexes are loaded with `allow_dangerous_deserialization=True` — only ever load indexes generated by this script from trusted local PDFs.
-- `faiss_indexes/` and `faiss_index/` contain generated artifacts (checked into this repo currently) tied to specific PDFs by content hash — don't hand-edit them.
+- `faiss_indexes/` contains generated artifacts tied to specific PDFs by content hash — don't hand-edit them. Any change to chunking, section-tagging, or the embedding model invalidates existing indexes (they'll error on load with a FAISS dimension mismatch, or silently serve stale content) — delete the relevant `faiss_indexes/<pdf>_<hash>/` directory to force a rebuild.
 - The vector store cache key is based on filename + size + mtime, not file content — renaming/touching a PDF without changing its content will cause a rebuild; two different PDFs that happen to share all three will collide.
+- Known limitation: the local LLM (llama3, 8B) sometimes fails to reliably extract facts from linearized PDF tables (e.g. connecting a tenure tier like "Year 11 and thereafter" to its own accrual figure a line later) — this is a model reasoning ceiling, not a retrieval/chunking bug, and isn't reliably fixable by tuning chunk parameters further.
