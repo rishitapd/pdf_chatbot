@@ -21,7 +21,7 @@ Requires a local [Ollama](https://ollama.com) server running with both:
 - `llama3` pulled (`ollama pull llama3`) — used for chat/generation and reranking (`LLM_MODEL` in main.py)
 - `nomic-embed-text` pulled (`ollama pull nomic-embed-text`) — used for embeddings (`EMBEDDING_MODEL` in main.py). `llama3` cannot be used for embeddings: it only declares Ollama's `completion` capability, not `embedding`, and will fail with a 501 error if you try.
 
-There is no `requirements.txt`/`pyproject.toml` in the repo. Dependencies observed in code: `langchain`, `langchain-community`, `langchain-ollama`, `langchain-core`, `faiss` (via `langchain_community.vectorstores.FAISS`), and the stdlib `tkinter`. Install what's missing before running.
+There is now a `requirements.txt` — `pip install -r requirements.txt` covers `main.py`'s dependencies plus `rank-bm25` (only needed by the experiments demo).
 
 There is no lint, test, or build command configured for this project.
 
